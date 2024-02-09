@@ -4,29 +4,29 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-const ADDR: &str = "127.0.0.1:10000";
+const ADDR: &str = "0.0.0.0:10000";
 
 pub async fn run() -> Result<()> {
     let listener = TcpListener::bind(ADDR).await.unwrap();
     println!("Listening on {ADDR}...");
 
     loop {
-        let (socket, _) = listener.accept().await?;
-        process(socket).await?;
+        let (socket, addr) = listener.accept().await?;
+        println!("Connected to {addr}");
+        tokio::spawn(async move { process(socket).await }).await?;
     }
 }
 
-async fn process(mut socket: TcpStream) -> Result<()> {
-    let mut data = Vec::new();
-    let mut buf = vec![0; 1024];
+async fn process(mut socket: TcpStream) {
+    let mut buf = vec![0; 4096];
 
     loop {
-        let n = socket.read(&mut buf).await?;
+        let n = socket.read(&mut buf).await.expect("read error");
         if n == 0 {
+            println!("EOF");
             break;
         }
-        data.extend(&buf[..n]);
+        println!("Received {n} bytes: {:?}", &buf[..n]);
+        socket.write(&buf[..n]).await.expect("write error");
     }
-    socket.write_all(&data).await?;
-    Ok(())
 }
