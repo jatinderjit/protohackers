@@ -139,4 +139,16 @@ mod test {
             .build();
         let _ = process(reader, writer).await;
     }
+
+    #[tokio::test]
+    async fn split_packets() {
+        let reader = tokio_test::io::Builder::new()
+            .read(b"{\"method\": \"isPrime\",")
+            .read(b"\"number\": 97}\n")
+            .build();
+        let writer = tokio_test::io::Builder::new()
+            .write(b"{\"method\":\"isPrime\",\"prime\":true}\n")
+            .build();
+        let _ = process(reader, writer).await;
+    }
 }
