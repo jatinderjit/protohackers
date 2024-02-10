@@ -81,13 +81,13 @@ impl Session {
             .range(start..=end)
             .map(|(_, p)| {
                 count += 1;
-                p
+                *p as i64
             })
-            .sum::<i32>();
+            .sum::<i64>();
         if count == 0 {
             0
         } else {
-            total / count
+            (total / count) as i32
         }
     }
 }
