@@ -1,21 +1,27 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
+use futures::StreamExt;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
+};
+use tokio_util::{
+    bytes::Buf,
+    codec::{Decoder, FramedRead},
 };
 
 use crate::config::ADDR;
 
-struct Session<R, W>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
+struct Session {
     prices: BTreeMap<u32, i32>,
-    reader: R,
-    writer: W,
+}
+
+#[derive(Debug)]
+enum Message {
+    Insert { timestamp: u32, price: i32 },
+    Query { start: u32, end: u32 },
+    Invalid,
 }
 
 pub async fn run() -> Result<()> {
@@ -26,87 +32,105 @@ pub async fn run() -> Result<()> {
         let (mut socket, addr) = listener.accept().await?;
         println!("Connected to {addr}");
         tokio::spawn(async move {
-            let (reader, writer) = socket.split();
             let mut session = Session {
                 prices: BTreeMap::new(),
-                reader,
-                writer,
             };
-            session.start().await
+            let (reader, writer) = socket.split();
+            session.start(reader, writer).await
         });
     }
 }
 
-impl<R, W> Session<R, W>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    async fn start(&mut self) -> Result<()> {
-        let mut msg = [0; 9];
-
-        loop {
-            let n = self.reader.read(&mut msg).await.expect("read error");
-            if n == 0 {
-                return Ok(());
-            }
-            if n == 9 {
-                self.handle_message(&msg).await?
-            } else {
-                self.undefined_behavior().await?;
-            }
+impl Session {
+    async fn start<R, W>(&mut self, reader: R, mut writer: W) -> Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut messages = FramedRead::new(reader, MessageDecoder);
+        while let Some(message) = messages.next().await {
+            println!("{message:?}");
+            match message {
+                Ok(Message::Query { start, end }) => {
+                    let mean = self.get_mean(start, end).await;
+                    println!("mean={mean}");
+                    writer.write_i32(mean).await?
+                }
+                Ok(Message::Insert { timestamp, price }) => {
+                    self.prices.insert(timestamp, price);
+                }
+                Ok(Message::Invalid) => {
+                    writer.write(b"undefined behavior").await?;
+                }
+                Err(e) => {
+                    println!("Message error: {e:?}");
+                    writer.write(b"undefined behavior").await?;
+                }
+            };
         }
+        Ok(())
     }
 
-    async fn handle_message(&mut self, msg: &[u8; 9]) -> Result<()> {
-        match msg[0] {
-            b'I' => Ok(self.insert(msg)),
-            b'Q' => self.query(msg).await,
-            _ => self.undefined_behavior().await,
-        }
-    }
-
-    fn insert(&mut self, msg: &[u8; 9]) {
-        let timestamp = read_uint(&msg[1..5]);
-        let price = read_uint(&msg[5..9]) as i32;
-        self.prices.insert(timestamp, price);
-        println!("Inserted: {timestamp} => {price}");
-    }
-
-    async fn query(&mut self, msg: &[u8; 9]) -> Result<()> {
-        let min_time = read_uint(&msg[1..5]);
-        let max_time = read_uint(&msg[5..9]);
-        if min_time > max_time {
-            return Ok(self.writer.write_i32(0).await?);
+    async fn get_mean(&mut self, start: u32, end: u32) -> i32 {
+        if start > end {
+            return 0;
         }
         let mut count = 0;
         let total = self
             .prices
-            .range(min_time..=max_time)
+            .range(start..=end)
             .map(|(_, p)| {
                 count += 1;
                 p
             })
             .sum::<i32>();
-        let mean = if count == 0 { 0 } else { total / count };
-        println!("{total} / {count} = {mean}");
-        println!("query: mean between {min_time} to {max_time} = {mean}");
-        Ok(self.writer.write_i32(mean).await?)
-    }
-
-    async fn undefined_behavior(&mut self) -> Result<()> {
-        println!("prices: {:?}", self.prices);
-        self.writer.write(b"undefined behavior").await?;
-        Ok(())
+        if count == 0 {
+            0
+        } else {
+            total / count
+        }
     }
 }
 
-fn read_uint(bytes: &[u8]) -> u32 {
+fn to_4bytes(bytes: &[u8]) -> [u8; 4] {
     assert_eq!(bytes.len(), 4);
-    let mut num = 0;
-    // Read number as Big-endian (network byte order)
-    bytes.iter().for_each(|b| num = (num << 8) + (*b as u32));
-    num
+    let mut b = [0u8; 4];
+    b.copy_from_slice(bytes);
+    b
+}
+
+struct MessageDecoder;
+
+impl Decoder for MessageDecoder {
+    type Item = Message;
+    type Error = anyhow::Error;
+
+    fn decode(
+        &mut self,
+        src: &mut tokio_util::bytes::BytesMut,
+    ) -> std::prelude::v1::Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 9 {
+            // Not enough data
+            return Ok(None);
+        }
+        let msg_type = src[0];
+        let num1 = to_4bytes(&src[1..5]);
+        let num2 = to_4bytes(&src[5..9]);
+        src.advance(9);
+        match msg_type {
+            b'I' => {
+                let timestamp = u32::from_be_bytes(num1);
+                let price = i32::from_be_bytes(num2);
+                Ok(Some(Message::Insert { timestamp, price }))
+            }
+            b'Q' => {
+                let start = u32::from_be_bytes(num1);
+                let end = u32::from_be_bytes(num2);
+                Ok(Some(Message::Query { start, end }))
+            }
+            _ => Ok(Some(Message::Invalid)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -133,12 +157,8 @@ mod test {
             .write(&[0x00, 0x00, 0x00, 0x65]) // 101
             .build();
         let prices = BTreeMap::new();
-        let mut session = Session {
-            prices,
-            reader,
-            writer,
-        };
-        let _ = session.start().await;
+        let mut session = Session { prices };
+        let _ = session.start(reader, writer).await;
     }
 
     #[tokio::test]
@@ -149,12 +169,8 @@ mod test {
             .build();
         let writer = tokio_test::io::Builder::new().write(&[0, 0, 0, 0]).build();
         let prices = BTreeMap::new();
-        let mut session = Session {
-            prices,
-            reader,
-            writer,
-        };
-        let _ = session.start().await;
+        let mut session = Session { prices };
+        let _ = session.start(reader, writer).await;
     }
 
     #[tokio::test]
@@ -173,12 +189,8 @@ mod test {
             .build();
         let writer = tokio_test::io::Builder::new().write(&[0, 0, 0, 0]).build();
         let prices = BTreeMap::new();
-        let mut session = Session {
-            prices,
-            reader,
-            writer,
-        };
-        let _ = session.start().await;
+        let mut session = Session { prices };
+        let _ = session.start(reader, writer).await;
     }
 
     #[tokio::test]
@@ -202,12 +214,8 @@ mod test {
             .write(&[0x00, 0x00, 0x00, 0x65])
             .build();
         let prices = BTreeMap::new();
-        let mut session = Session {
-            prices,
-            reader,
-            writer,
-        };
-        let _ = session.start().await;
+        let mut session = Session { prices };
+        let _ = session.start(reader, writer).await;
     }
 
     #[tokio::test]
@@ -215,27 +223,36 @@ mod test {
         let reader = tokio_test::io::Builder::new()
             // I 12345 101
             .read(&[0x49, 0x00, 0x00, 0x30, 0x39, 0x00, 0x00, 0x00, 0x65])
+            .read(&[0x49, 0x00, 0x00, 0xa0, 0x00])
+            .build();
+        let writer = tokio_test::io::Builder::new()
+            .write(b"undefined behavior")
+            .build();
+        let prices = BTreeMap::new();
+        let mut session = Session { prices };
+        let _ = session.start(reader, writer).await;
+    }
+
+    #[tokio::test]
+    async fn split_messages() {
+        let reader = tokio_test::io::Builder::new()
+            // I 12345 101
+            .read(&[0x49, 0x00, 0x00, 0x30])
+            .read(&[0x39, 0x00, 0x00, 0x00, 0x65])
             // I 12346 102
             .read(&[0x49, 0x00, 0x00, 0x30, 0x3a, 0x00, 0x00, 0x00, 0x66])
             // I 12347 100
             .read(&[0x49, 0x00, 0x00, 0x30, 0x3b, 0x00, 0x00, 0x00, 0x64])
             // I 40960 5
             .read(&[0x49, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x05])
-            // I 16384 (invalid)
-            .read(&[0x49, 0x00, 0x00, 0xa0, 0x00])
             // Q 16384 12288
             .read(&[0x51, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x40, 0x00])
             .build();
         let writer = tokio_test::io::Builder::new()
-            .write(b"undefined behavior")
             .write(&[0x00, 0x00, 0x00, 0x65])
             .build();
         let prices = BTreeMap::new();
-        let mut session = Session {
-            prices,
-            reader,
-            writer,
-        };
-        let _ = session.start().await;
+        let mut session = Session { prices };
+        let _ = session.start(reader, writer).await;
     }
 }
