@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -14,7 +17,17 @@ use tokio_util::{
 use crate::config::ADDR;
 
 struct Session {
+    id: u32,
     prices: BTreeMap<u32, i32>,
+}
+
+impl Session {
+    fn new() -> Session {
+        static ID: AtomicU32 = AtomicU32::new(0);
+        let id = ID.fetch_add(1, Ordering::Relaxed);
+        let prices = BTreeMap::new();
+        Session { id, prices }
+    }
 }
 
 #[derive(Debug)]
@@ -32,9 +45,7 @@ pub async fn run() -> Result<()> {
         let (mut socket, addr) = listener.accept().await?;
         println!("Connected to {addr}");
         tokio::spawn(async move {
-            let mut session = Session {
-                prices: BTreeMap::new(),
-            };
+            let mut session = Session::new();
             let (reader, writer) = socket.split();
             session.start(reader, writer).await
         });
@@ -49,11 +60,11 @@ impl Session {
     {
         let mut messages = FramedRead::new(reader, MessageDecoder);
         while let Some(message) = messages.next().await {
-            println!("{message:?}");
+            println!("id={}, {message:?}", self.id);
             match message {
                 Ok(Message::Query { start, end }) => {
                     let mean = self.get_mean(start, end).await;
-                    println!("mean={mean}");
+                    println!("id={}, mean={mean}", self.id);
                     writer.write_i32(mean).await?
                 }
                 Ok(Message::Insert { timestamp, price }) => {
@@ -135,8 +146,6 @@ impl Decoder for MessageDecoder {
 
 #[cfg(test)]
 mod test {
-    use std::collections::BTreeMap;
-
     use super::Session;
 
     #[tokio::test]
@@ -156,8 +165,7 @@ mod test {
         let writer = tokio_test::io::Builder::new()
             .write(&[0x00, 0x00, 0x00, 0x65]) // 101
             .build();
-        let prices = BTreeMap::new();
-        let mut session = Session { prices };
+        let mut session = Session::new();
         let _ = session.start(reader, writer).await;
     }
 
@@ -168,8 +176,7 @@ mod test {
             .read(&[0x51, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x40, 0x00])
             .build();
         let writer = tokio_test::io::Builder::new().write(&[0, 0, 0, 0]).build();
-        let prices = BTreeMap::new();
-        let mut session = Session { prices };
+        let mut session = Session::new();
         let _ = session.start(reader, writer).await;
     }
 
@@ -188,8 +195,7 @@ mod test {
             .read(&[0x51, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x30, 0x00])
             .build();
         let writer = tokio_test::io::Builder::new().write(&[0, 0, 0, 0]).build();
-        let prices = BTreeMap::new();
-        let mut session = Session { prices };
+        let mut session = Session::new();
         let _ = session.start(reader, writer).await;
     }
 
@@ -213,8 +219,7 @@ mod test {
             .write(b"undefined behavior")
             .write(&[0x00, 0x00, 0x00, 0x65])
             .build();
-        let prices = BTreeMap::new();
-        let mut session = Session { prices };
+        let mut session = Session::new();
         let _ = session.start(reader, writer).await;
     }
 
@@ -228,8 +233,7 @@ mod test {
         let writer = tokio_test::io::Builder::new()
             .write(b"undefined behavior")
             .build();
-        let prices = BTreeMap::new();
-        let mut session = Session { prices };
+        let mut session = Session::new();
         let _ = session.start(reader, writer).await;
     }
 
@@ -251,8 +255,7 @@ mod test {
         let writer = tokio_test::io::Builder::new()
             .write(&[0x00, 0x00, 0x00, 0x65])
             .build();
-        let prices = BTreeMap::new();
-        let mut session = Session { prices };
+        let mut session = Session::new();
         let _ = session.start(reader, writer).await;
     }
 }
