@@ -2,6 +2,6 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    protohackers::smoke::run().await?;
+    protohackers::bank::run().await?;
     Ok(())
 }
