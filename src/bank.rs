@@ -18,7 +18,7 @@ use crate::config::ADDR;
 
 struct Session {
     id: u32,
-    prices: BTreeMap<u32, i32>,
+    prices: BTreeMap<i32, i32>,
 }
 
 impl Session {
@@ -32,8 +32,8 @@ impl Session {
 
 #[derive(Debug)]
 enum Message {
-    Insert { timestamp: u32, price: i32 },
-    Query { start: u32, end: u32 },
+    Insert { timestamp: i32, price: i32 },
+    Query { start: i32, end: i32 },
     Invalid,
 }
 
@@ -82,7 +82,7 @@ impl Session {
         Ok(())
     }
 
-    async fn get_mean(&mut self, start: u32, end: u32) -> i32 {
+    async fn get_mean(&mut self, start: i32, end: i32) -> i32 {
         if start > end {
             return 0;
         }
@@ -103,11 +103,11 @@ impl Session {
     }
 }
 
-fn to_4bytes(bytes: &[u8]) -> [u8; 4] {
+fn to_num(bytes: &[u8]) -> i32 {
     assert_eq!(bytes.len(), 4);
     let mut b = [0u8; 4];
     b.copy_from_slice(bytes);
-    b
+    i32::from_be_bytes(b)
 }
 
 struct MessageDecoder;
@@ -125,18 +125,18 @@ impl Decoder for MessageDecoder {
             return Ok(None);
         }
         let msg_type = src[0];
-        let num1 = to_4bytes(&src[1..5]);
-        let num2 = to_4bytes(&src[5..9]);
+        let num1 = to_num(&src[1..5]);
+        let num2 = to_num(&src[5..9]);
         src.advance(9);
         match msg_type {
             b'I' => {
-                let timestamp = u32::from_be_bytes(num1);
-                let price = i32::from_be_bytes(num2);
+                let timestamp = num1;
+                let price = num2;
                 Ok(Some(Message::Insert { timestamp, price }))
             }
             b'Q' => {
-                let start = u32::from_be_bytes(num1);
-                let end = u32::from_be_bytes(num2);
+                let start = num1;
+                let end = num2;
                 Ok(Some(Message::Query { start, end }))
             }
             _ => Ok(Some(Message::Invalid)),
@@ -254,6 +254,23 @@ mod test {
             .build();
         let writer = tokio_test::io::Builder::new()
             .write(&[0x00, 0x00, 0x00, 0x65])
+            .build();
+        let mut session = Session::new();
+        let _ = session.start(reader, writer).await;
+    }
+
+    #[tokio::test]
+    async fn negative_timestamps() {
+        let reader = tokio_test::io::Builder::new()
+            .read(&[0x49, 0x00, 0x00, 0x00, 0x00, 0x77, 0x35, 0x94, 0x00])
+            .read(&[0x49, 0x00, 0x00, 0x00, 0x01, 0x7a, 0x30, 0x84, 0x80])
+            .read(&[0x49, 0x00, 0x00, 0x00, 0x02, 0x7d, 0x2b, 0x75, 0x00])
+            .read(&[0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
+            .read(&[0x51, 0x82, 0xd4, 0x8b, 0x00, 0x7d, 0x2b, 0x75, 0x00])
+            .build();
+        let writer = tokio_test::io::Builder::new()
+            .write(&[0x7a, 0x30, 0x84, 0x80])
+            .write(&[0x7a, 0x30, 0x84, 0x80])
             .build();
         let mut session = Session::new();
         let _ = session.start(reader, writer).await;
